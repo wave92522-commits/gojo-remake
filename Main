@@ -1,0 +1,2561 @@
+--[[
+	THE HONORED ONE — Gojo script pack · client-side damage edition
+	================================================================
+	Что изменилось относительно оригинала:
+	  • добавлен конфиг урона getgenv().GojoDamageConfig (ниже);
+	  • встроена библиотека GojoDamage (getgenv().GojoDamage) — client-side урон,
+	    общий для HollowPurple / InfiniteVoid / ImaginaryPurple / UnlimitedPurple;
+	  • исправлен баг: ReplicatedStorage не был объявлен (inserted.Parent = nil);
+	  • The Honored One: после пробуждения — обратная техника (RCT) на себя.
+	Все 4 способности и библиотека урона встроены в ЭТОТ скрипт.
+	Никаких отдельных Lua-файлов или внешних loadstring не требуется.
+	Интернет нужен только для исходных ассетов Gojo.rbxmx и mp3.
+]]
+
+if not isfile("Gojo.rbxmx") then
+	writefile("Gojo.rbxmx", game:HttpGet("https://github.com/ian49972/RBXMS/raw/refs/heads/main/Gojo.rbxmx"))
+end
+
+writefile("Purple.mp3", game:HttpGet("https://github.com/ian49972/smth/raw/refs/heads/main/Purple.mp3"))
+
+writefile("UnlimitedPurple.mp3", game:HttpGet("https://github.com/ian49972/smth/raw/refs/heads/main/UnlimitedPurple.mp3"))
+
+writefile("ImaginaryPurple.mp3", game:HttpGet("https://github.com/ian49972/smth/raw/refs/heads/main/ImaginaryPurple.mp3"))
+
+writefile("Domain.mp3", game:HttpGet("https://github.com/ian49972/smth/raw/refs/heads/main/Domain.mp3"))
+
+writefile("Honored.mp3", game:HttpGet("https://github.com/ian49972/smth/raw/refs/heads/main/Honored.mp3"))
+
+local Players = game:GetService("Players")
+local TS = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage") -- [FIX] раньше не был объявлен
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- ═══════════════════════ [DAMAGE] НАСТРОЙКИ CLIENT-SIDE УРОНА ═══════════════════════
+-- Все *Fraction — доля от MaxHealth цели (0.5 = 50% HP). Радиусы — в стадах.
+-- Весь урон виден ТОЛЬКО тебе (локально): сервер и другие игроки его не получают.
+getgenv().GojoDamageConfig = {
+	HitPlayers = true,          -- бить персонажей игроков
+	HitNPCs = true,             -- бить NPC / манекенов
+	IgnoreForceField = true,    -- Purple стирает — ForceField не спасает
+	ShowDamageNumbers = true,   -- всплывающие цифры над целью
+	EraseVisual = true,         -- стёртых растворять (локально)
+	Debug = true,               -- тайминги в консоль (F9): [GojoDamage][Hollow Purple +22.21s] ...
+	Whitelist = {},             -- { ["NickName"] = true } — не трогать этих
+
+	-- 虚式「茈」 Hollow Purple: мнимая масса, стирает всё на пути. Снаряд Purple2 = сфера 35 st.
+	HollowPurple = {
+		HitRadius = 17.5,         -- = 35 / 2 — ровно визуальная сфера
+		Lethal = true,            -- прямое попадание = стирание
+		DirectFraction = 1.0,     -- (если Lethal = false) доля HP за прямое
+		ShockwaveRadius = 30,     -- ударная волна по касательной
+		ShockwaveFraction = 0.5,  -- −50% HP
+	},
+	-- Imaginary Purple: Purple с одной руки. Снаряд PurpleShoot = 15.3 st + свечение/молнии.
+	ImaginaryPurple = {
+		HitRadius = 14,
+		Lethal = true,
+		DirectFraction = 1.0,
+		ShockwaveRadius = 26,
+		ShockwaveFraction = 0.6,  -- −60% HP
+	},
+	-- Unlimited Hollow Purple ("200%"): Blue по орбите → Red → слияние → гигантский взрыв над головой.
+	UnlimitedPurple = {
+		BlueContactRadius = 7,        -- Blue 7.7 st летает по орбите R=32 вокруг тебя
+		BlueContactFraction = 0.25,   -- −25% HP за касание
+		BlueContactCooldown = 0.6,    -- кд на одну цель
+		RedPulseRadius = 16,          -- импульс Red у ног в момент выстрела
+		RedPulseFraction = 0.35,      -- −35% HP
+		ExplosionLethalRadius = 220,  -- внутри — стирание
+		ExplosionMaxRadius = 360,     -- затухание до края
+		ExplosionEdgeFraction = 0.35, -- урон на краю (90% у границы стирания → 35% на краю)
+		ExplosionExpandTime = 0.35,   -- фронт расширяется за вспышку частиц PurpleExplode
+	},
+	-- 無量空処 Unlimited Void: sure-hit — бесконечная информация → паралич, мозг "перегорает".
+	InfiniteVoid = {
+		Radius = 200,               -- радиус домена вокруг точки каста (≈200 м как в Сибуе)
+		TickInterval = 0.5,         -- тик перегрузки
+		TotalDamageFraction = 1.0,  -- суммарно за 24 с домена (48 тиков ≈ 2.08% HP каждый)
+		Paralyze = true,            -- паралич пойманных
+		FreezeInPlace = true,       -- локально якорить на месте
+		KillOnCollapse = true,      -- добить при схлопывании домена (t ≈ 28.5s)
+	},
+	-- Пробуждение: атак нет — только обратная техника (RCT) на себя.
+	HonoredOne = {
+		SelfHeal = true,
+	},
+}
+
+-- ====================== CLIENT-SIDE DAMAGE ======================
+getgenv().GojoDamage = (function()
+--[[
+	GojoDamage — client-side слой урона для скрипт-пака Gojo (The Honored One)
+	==========================================================================
+	• Урон меняет Humanoid.Health ТОЛЬКО на твоём клиенте. Сервер и другие игроки
+	  ничего не видят — это чисто client-side (визуальный) урон.
+	• Библиотека кладётся в getgenv().GojoDamage и используется из
+	  HollowPurple / InfiniteVoid / ImaginaryPurple / UnlimitedPurple.
+	• Вызовы урона стоят РОВНО в тех строках, где появляется визуал:
+	  снаряд создан → свип подключён в тот же Heartbeat (после движения снаряда),
+	  взрыв появился → урон в тот же кадр, домен открылся → sure-hit в тот же кадр.
+	  Погрешность ≤ 1 кадра (~16 мс при 60 FPS).
+	• Настройки берутся из getgenv().GojoDamageConfig (задаётся в Main), иначе DEFAULTS.
+]]
+
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris       = game:GetService("Debris")
+
+local LocalPlayer = Players.LocalPlayer
+local genv = (typeof(getgenv) == "function") and getgenv() or _G
+
+-- ───────────────────────────── НАСТРОЙКИ ПО УМОЛЧАНИЮ ─────────────────────────────
+-- Все "Fraction" — доля от MaxHealth цели (0.5 = 50% HP), чтобы "стирание" Purple
+-- работало одинаково и по игроку со 100 HP, и по боссу с 10 000 HP.
+local DEFAULTS = {
+	HitPlayers = true,         -- бить персонажей игроков
+	HitNPCs = true,            -- бить NPC / манекенов (любой Humanoid не-игрока)
+	IgnoreForceField = true,   -- Purple "стирает" — ForceField не спасает
+	ShowDamageNumbers = false, -- без всплывающих "-XX урона"
+	EraseVisual = true,        -- стёртых Purple'ом растворять (локально)
+	Debug = true,              -- печатать тайминги в консоль (F9)
+	Whitelist = {},            -- { ["NickName"] = true } — этих не трогать
+
+	-- 虚式「茈」 Hollow Purple — стирает всё в радиусе снаряда, без частичного урона.
+	HollowPurple = {
+		HitRadius = 20,            -- чуть больше визуала (Purple2 35 st), чтобы не было "чуть задело — жив"
+		Lethal = true,
+		DirectFraction = 1.0,
+		ShockwaveRadius = 0,
+		ShockwaveFraction = 0,
+	},
+	-- Imaginary Purple (одной рукой)
+	ImaginaryPurple = {
+		HitRadius = 18,
+		Lethal = true,
+		DirectFraction = 1.0,
+		ShockwaveRadius = 0,
+		ShockwaveFraction = 0,
+	},
+	-- "200%" Unlimited Hollow Purple
+	UnlimitedPurple = {
+		BlueContactRadius = 10,
+		BlueContactLethal = true,
+		BlueContactFraction = 1.0,
+		BlueContactCooldown = 1.0,
+		RedPulseRadius = 25,
+		RedPulseLethal = true,
+		RedPulseFraction = 1.0,
+		ExplosionLethalRadius = 400, -- весь фронт взрыва стирает
+		ExplosionMaxRadius = 400,
+		ExplosionEdgeFraction = 1.0,
+		ExplosionExpandTime = 0.45,
+	},
+	-- 無量空処 Unlimited Void — мгновенное стирание в радиусе + паралич визуально, без телепорта
+	InfiniteVoid = {
+		Radius = 220,
+		TickInterval = 0.5,
+		TotalDamageFraction = 1.0,
+		Paralyze = true,
+		FreezeInPlace = true,
+		InstantEraseOnOpen = true,   -- стереть всех пойманных сразу при открытии домена
+		KillOnCollapse = true,       -- добить тех, кто вошёл позже
+		NoTeleport = true,           -- НЕ телепортировать игрока ни в домен, ни обратно
+	},
+	HonoredOne = {
+		SelfHeal = true,
+	},
+}
+
+local function merge(dst, src)
+	for k, v in pairs(src) do
+		if type(v) == "table" then
+			if type(dst[k]) ~= "table" then dst[k] = {} end
+			merge(dst[k], v)
+		elseif dst[k] == nil then
+			dst[k] = v
+		end
+	end
+	return dst
+end
+
+local Lib = {}
+Lib.Version = "1.0"
+Lib.Config = merge(type(genv.GojoDamageConfig) == "table" and genv.GojoDamageConfig or {}, DEFAULTS)
+
+local COLORS = {
+	Purple = Color3.fromRGB(176, 84, 255),
+	Blue   = Color3.fromRGB(80, 160, 255),
+	Red    = Color3.fromRGB(255, 80, 80),
+	Void   = Color3.fromRGB(235, 235, 255),
+	Heal   = Color3.fromRGB(120, 255, 160),
+}
+Lib.Colors = COLORS
+
+-- ───────────────────────────── ЛОГ ТАЙМИНГОВ ─────────────────────────────
+local abilityName, abilityT0 = "Gojo", os.clock()
+
+function Lib.Now()
+	return os.clock() - abilityT0
+end
+
+function Lib.Log(fmt, ...)
+	if not Lib.Config.Debug then return end
+	local ok, msg = pcall(string.format, fmt, ...)
+	print(string.format("[GojoDamage][%s +%.2fs] %s", abilityName, Lib.Now(), ok and msg or tostring(fmt)))
+end
+
+-- Вызывается в начале каждой способности: все тайминги в логе считаются от этого момента
+function Lib.Mark(name)
+	abilityName, abilityT0 = name, os.clock()
+	Lib.Log("активирована — тайминги считаем от 0.00s")
+end
+
+-- ───────────────────────────── ПОИСК ЦЕЛЕЙ ─────────────────────────────
+local humanoids = {}
+local function track(inst)
+	if inst:IsA("Humanoid") then humanoids[inst] = true end
+end
+for _, d in ipairs(workspace:GetDescendants()) do track(d) end
+workspace.DescendantAdded:Connect(track)
+
+local TARGET_PADDING = 2 -- половина "толщины" персонажа, чтобы хитбокс не был заниженным
+
+local function isAllowed(char)
+	local cfg = Lib.Config
+	if cfg.Whitelist and cfg.Whitelist[char.Name] then return false end
+	local plr = Players:GetPlayerFromCharacter(char)
+	if plr then return cfg.HitPlayers and plr ~= LocalPlayer end
+	return cfg.HitNPCs
+end
+
+function Lib.GetTargets()
+	local list = {}
+	local myChar = LocalPlayer.Character
+	for hum in pairs(humanoids) do
+		if not hum:IsDescendantOf(workspace) then
+			humanoids[hum] = nil
+		else
+			local char = hum.Parent
+			if char and char:IsA("Model") and char ~= myChar and hum.Health > 0 and isAllowed(char) then
+				local root = hum.RootPart or char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart")
+				if root then
+					list[#list + 1] = {
+						Humanoid = hum,
+						Character = char,
+						Root = root,
+						Head = char:FindFirstChild("Head"),
+					}
+				end
+			end
+		end
+	end
+	return list
+end
+
+local function distanceTo(target, point)
+	local d = (target.Root.Position - point).Magnitude
+	local head = target.Head
+	if head and head:IsA("BasePart") then
+		d = math.min(d, (head.Position - point).Magnitude)
+	end
+	return d - TARGET_PADDING
+end
+Lib.DistanceTo = distanceTo
+
+-- ───────────────────────────── ВИЗУАЛ ─────────────────────────────
+local function popup(target, text, color)
+	if not Lib.Config.ShowDamageNumbers then return end
+	local anchor = (target.Head and target.Head:IsA("BasePart")) and target.Head or target.Root
+	if not anchor then return end
+
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "GojoDmg"
+	gui.AlwaysOnTop = true
+	gui.LightInfluence = 0
+	gui.Size = UDim2.new(0, 220, 0, 56)
+	gui.StudsOffset = Vector3.new(math.random(-8, 8) / 10, 2.6, 0)
+	gui.Adornee = anchor
+	gui.Parent = anchor
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBlack
+	label.TextScaled = true
+	label.Text = text
+	label.TextColor3 = color or COLORS.Purple
+	label.TextStrokeColor3 = Color3.new(0, 0, 0)
+	label.TextStrokeTransparency = 0.15
+	label.Parent = gui
+
+	TweenService:Create(gui, TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		StudsOffset = gui.StudsOffset + Vector3.new(0, 3, 0),
+	}):Play()
+	TweenService:Create(label, TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		TextTransparency = 1,
+		TextStrokeTransparency = 1,
+	}):Play()
+	Debris:AddItem(gui, 1.05)
+end
+Lib.Popup = popup
+
+-- Постоянная метка над головой (используется доменом), вернёт объект для Destroy()
+local function statusTag(target, text, color)
+	local anchor = (target.Head and target.Head:IsA("BasePart")) and target.Head or target.Root
+	if not anchor then return nil end
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "GojoTag"
+	gui.AlwaysOnTop = true
+	gui.LightInfluence = 0
+	gui.Size = UDim2.new(0, 120, 0, 40)
+	gui.StudsOffset = Vector3.new(0, 4.2, 0)
+	gui.Adornee = anchor
+	gui.Parent = anchor
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBlack
+	label.TextScaled = true
+	label.Text = text
+	label.TextColor3 = color or COLORS.Void
+	label.TextStrokeColor3 = Color3.new(0, 0, 0)
+	label.TextStrokeTransparency = 0.2
+	label.Parent = gui
+	return gui
+end
+
+-- "Стирание": локально растворяем модель цели
+local function eraseVisual(char)
+	if not char then return end
+	for _, p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") or p:IsA("Decal") then
+			TweenService:Create(p, TweenInfo.new(0.45, Enum.EasingStyle.Quad), { Transparency = 1 }):Play()
+		elseif p:IsA("ParticleEmitter") or p:IsA("Trail") or p:IsA("Beam") then
+			p.Enabled = false
+		end
+	end
+end
+
+-- ───────────────────────────── НАНЕСЕНИЕ УРОНА (client-side) ─────────────────────────────
+-- amount = math.huge → мгновенная смерть. Возвращает (попал, летально)
+function Lib.Hurt(target, amount, label, color, erase)
+	local hum = target.Humanoid
+	if not hum or hum.Health <= 0 then return false, false end
+
+	local lethal = (amount == math.huge) or (amount >= hum.Health)
+	if lethal then
+		hum.Health = 0                       -- локальная смерть (Dead state, BreakJoints у тебя на экране)
+	elseif Lib.Config.IgnoreForceField then
+		hum.Health = hum.Health - amount
+	else
+		hum:TakeDamage(amount)               -- уважает ForceField
+	end
+
+	popup(target, lethal and (label or "☠") or ("-" .. tostring(math.floor(amount + 0.5))), color or COLORS.Purple)
+	if lethal and erase and Lib.Config.EraseVisual then eraseVisual(target.Character) end
+	Lib.Log("%s ← %s%s", target.Character.Name,
+		lethal and "СТЁРТ" or string.format("-%.0f HP", amount),
+		label and (" [" .. label .. "]") or "")
+	return true, lethal
+end
+
+-- ───────────────────────────── СНАРЯД (свип каждый кадр) ─────────────────────────────
+-- opts: Part, Radius, Lethal, DirectFraction, ShockRadius, ShockFraction, Duration, Name
+-- Подключать СРАЗУ после Heartbeat-коннекта, который двигает снаряд → в том же кадре
+-- берётся уже обновлённая позиция.
+function Lib.Sweep(opts)
+	local part = opts.Part
+	if not part then return { Stop = function() end, Hits = {} } end
+
+	local radius     = opts.Radius or (math.max(part.Size.X, part.Size.Y, part.Size.Z) / 2)
+	local shockR     = opts.ShockRadius
+	local lethal     = opts.Lethal ~= false
+	local directFrac = opts.DirectFraction or 1
+	local shockFrac  = opts.ShockFraction or 0.5
+	local duration   = opts.Duration
+	local name       = opts.Name or part.Name
+	local hits       = {}
+	local t0         = os.clock()
+
+	Lib.Log("%s: свип снаряда включён (R=%.1f, волна R=%s, %s)", name, radius,
+		shockR and string.format("%.1f", shockR) or "-",
+		lethal and "прямое = стирание" or string.format("прямое = %.0f%% HP", directFrac * 100))
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not part.Parent or (duration and os.clock() - t0 >= duration) then
+			conn:Disconnect()
+			Lib.Log("%s: свип выключен", name)
+			return
+		end
+		local pos = part.Position
+		for _, t in ipairs(Lib.GetTargets()) do
+			local state = hits[t.Humanoid]
+			if state ~= "direct" then
+				local d = distanceTo(t, pos)
+				if d <= radius then
+					hits[t.Humanoid] = "direct"
+					Lib.Hurt(t, lethal and math.huge or t.Humanoid.MaxHealth * directFrac, "ERASED", COLORS.Purple, lethal)
+				elseif shockR and not state and d <= shockR then
+					hits[t.Humanoid] = "shock"
+					Lib.Hurt(t, t.Humanoid.MaxHealth * shockFrac, nil, COLORS.Purple)
+				end
+			end
+		end
+	end)
+
+	return {
+		Hits = hits,
+		Stop = function() if conn then conn:Disconnect() end end,
+	}
+end
+
+-- ───────────────────────────── КОНТАКТ (орбита Blue) ─────────────────────────────
+-- opts: Part, Radius, Fraction, Cooldown, Name, Color
+function Lib.Contact(opts)
+	local part = opts.Part
+	if not part then return { Stop = function() end } end
+	local radius   = opts.Radius or 6
+	local lethal   = opts.Lethal ~= false
+	local frac     = opts.Fraction or 1.0
+	local cooldown = opts.Cooldown or 0.5
+	local name     = opts.Name or part.Name
+	local lastHit  = {}
+	local label    = opts.Label or (lethal and "ERASED" or nil)
+
+	Lib.Log("%s: контактный урон включён (R=%.1f, %s, кд %.1fs)",
+		name, radius, lethal and "СТИРАНИЕ" or string.format("%.0f%% HP", frac * 100), cooldown)
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not part.Parent then conn:Disconnect() return end
+		local now = os.clock()
+		local pos = part.Position
+		for _, t in ipairs(Lib.GetTargets()) do
+			if distanceTo(t, pos) <= radius then
+				local last = lastHit[t.Humanoid]
+				if not last or now - last >= cooldown then
+					lastHit[t.Humanoid] = now
+					local dmg = lethal and math.huge or t.Humanoid.MaxHealth * frac
+					Lib.Hurt(t, dmg, label, opts.Color or COLORS.Blue, lethal)
+				end
+			end
+		end
+	end)
+
+	return {
+		Stop = function()
+			if conn then conn:Disconnect() conn = nil end
+			Lib.Log("%s: контактный урон выключен", name)
+		end,
+	}
+end
+
+-- ───────────────────────────── ИМПУЛЬС (одноразовая сфера) ─────────────────────────────
+-- opts: Position, Radius, Fraction/lethal, Name, Color
+function Lib.Pulse(opts)
+	local pos    = opts.Position
+	local radius = opts.Radius or 10
+	local lethal = opts.Lethal ~= false
+	local frac   = opts.Fraction or 1.0
+	local n      = 0
+	for _, t in ipairs(Lib.GetTargets()) do
+		if distanceTo(t, pos) <= radius then
+			n = n + 1
+			local dmg = lethal and math.huge or t.Humanoid.MaxHealth * frac
+			Lib.Hurt(t, dmg, lethal and "ERASED" or nil, opts.Color or COLORS.Red, lethal)
+		end
+	end
+	Lib.Log("%s: импульс R=%.0f, %s — задето %d",
+		opts.Name or "Pulse", radius, lethal and "СТИРАНИЕ" or string.format("%.0f%% HP", frac * 100), n)
+	return n
+end
+
+-- ───────────────────────────── ВЗРЫВ (расширяющийся фронт) ─────────────────────────────
+-- opts: Position, MaxRadius, ExpandTime, Name
+-- Всё что накрывает расширяющийся фронт — стирается (мгновенная смерть + растворение).
+function Lib.Explosion(opts)
+	local pos    = opts.Position
+	local maxR   = opts.MaxRadius or opts.LethalRadius or 200
+	local expand = opts.ExpandTime or 0
+	local name   = opts.Name or "Explosion"
+	local hit    = {}
+	local t0     = os.clock()
+
+	Lib.Log("%s: взрыв в (%.0f, %.0f, %.0f) — СТИРАНИЕ до R=%.0f, фронт %.2fs",
+		name, pos.X, pos.Y, pos.Z, maxR, expand)
+
+	local function pass(frontR)
+		for _, t in ipairs(Lib.GetTargets()) do
+			if not hit[t.Humanoid] then
+				local d = distanceTo(t, pos)
+				if d <= frontR then
+					hit[t.Humanoid] = true
+					Lib.Hurt(t, math.huge, "ERASED", COLORS.Purple, true)
+				end
+			end
+		end
+	end
+
+	if expand <= 0 then
+		pass(maxR)
+		return { Hits = hit }
+	end
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		local a = math.clamp((os.clock() - t0) / expand, 0, 1)
+		pass(maxR * a)
+		if a >= 1 then
+			conn:Disconnect()
+			Lib.Log("%s: фронт взрыва достиг R=%.0f", name, maxR)
+		end
+	end)
+	return { Hits = hit }
+end
+
+-- ───────────────────────────── ДОМЕН (sure-hit + тики + паралич) ─────────────────────────────
+local function paralyzeTarget(rec, freeze)
+	local t = rec.Target
+	local hum, root = t.Humanoid, t.Root
+	rec.Saved = {
+		WalkSpeed = hum.WalkSpeed, JumpPower = hum.JumpPower, JumpHeight = hum.JumpHeight,
+		AutoRotate = hum.AutoRotate, PlatformStand = hum.PlatformStand, Anchored = root.Anchored,
+	}
+	hum.WalkSpeed = 0
+	hum.JumpPower = 0
+	hum.JumpHeight = 0
+	hum.AutoRotate = false
+	hum.PlatformStand = true
+	if freeze then pcall(function() root.Anchored = true end) end
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if animator then
+		for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do tr:Stop(0) end
+	end
+end
+
+local function releaseTarget(rec)
+	local s = rec.Saved
+	if not s then return end
+	local t = rec.Target
+	local hum, root = t.Humanoid, t.Root
+	pcall(function()
+		hum.WalkSpeed = s.WalkSpeed
+		hum.JumpPower = s.JumpPower
+		hum.JumpHeight = s.JumpHeight
+		hum.AutoRotate = s.AutoRotate
+		hum.PlatformStand = s.PlatformStand
+		root.Anchored = s.Anchored
+	end)
+end
+
+-- opts: Position, Radius, TickInterval, Duration, TotalFraction, Paralyze, FreezeInPlace, KillOnCollapse, Name
+-- Первый тик — в момент открытия домена (sure-hit попадает сразу). Далее ровно каждые TickInterval.
+-- Цели, вошедшие в радиус позже, тоже попадают под домен.
+function Lib.Domain(opts)
+	local pos              = opts.Position
+	local radius           = opts.Radius or 200
+	local interval         = opts.TickInterval or 0.5
+	local duration         = opts.Duration or 24
+	local totalFrac        = opts.TotalFraction or 1
+	local paralyze         = opts.Paralyze ~= false
+	local freeze           = opts.FreezeInPlace ~= false
+	local killOnCollapse   = opts.KillOnCollapse ~= false
+	local instantErase     = opts.InstantEraseOnOpen ~= false
+	local name             = opts.Name or "Domain"
+
+	local ticks   = instantErase and 0 or math.max(1, math.floor(duration / interval + 0.5))
+	local perTick = instantErase and 0 or (totalFrac / ticks)
+	local victims = {}
+	local t0      = os.clock()
+	local nextTick, tickCount = t0, 0
+
+	Lib.Log("%s: домен открыт — R=%.0f, %s",
+		name, radius, instantErase and "мгновенное стирание" or string.format("%d тиков по %.2fs, %.2f%% HP за тик", ticks, interval, perTick * 100))
+
+	local function capture(eraseNow)
+		for _, t in ipairs(Lib.GetTargets()) do
+			if not victims[t.Humanoid] then
+				local d = distanceTo(t, pos)
+				if d <= radius then
+					local rec = { Target = t }
+					victims[t.Humanoid] = rec
+					if paralyze then paralyzeTarget(rec, freeze) end
+					rec.Tag = statusTag(t, "∞", COLORS.Void)
+					Lib.Log("%s: %s пойман (d=%.0f)", name, t.Character.Name, d)
+					if eraseNow then
+						Lib.Hurt(t, math.huge, "VOID", COLORS.Void, true)
+					end
+				end
+			end
+		end
+	end
+
+	-- Мгновенное стирание при открытии домена (sure-hit)
+	if instantErase then
+		capture(true)
+	end
+
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		local now = os.clock()
+		if instantErase then
+			-- Ловим всех, кто зайдёт в радиус уже после открытия — стираем сразу при попадании
+			capture(true)
+			if now - t0 >= duration then conn:Disconnect() end
+			return
+		end
+		while tickCount < ticks and now >= nextTick do
+			tickCount = tickCount + 1
+			nextTick = nextTick + interval
+			capture()
+			for hum, rec in pairs(victims) do
+				if hum.Health > 0 then
+					Lib.Hurt(rec.Target, hum.MaxHealth * perTick, nil, COLORS.Void)
+				end
+			end
+		end
+		if tickCount >= ticks then conn:Disconnect() end
+	end)
+
+	local handle = { Victims = victims }
+	function handle.Collapse()
+		if conn then conn:Disconnect() end
+		local n = 0
+		for hum, rec in pairs(victims) do
+			n = n + 1
+			if killOnCollapse and hum.Health > 0 then
+				Lib.Hurt(rec.Target, math.huge, "VOID", COLORS.Void)
+			end
+			if rec.Tag then rec.Tag:Destroy() end
+			if paralyze then releaseTarget(rec) end
+		end
+		Lib.Log("%s: домен схлопнулся — жертв: %d", name, n)
+	end
+	return handle
+end
+
+-- ───────────────────────────── ОБРАТНАЯ ТЕХНИКА (Honored One) ─────────────────────────────
+function Lib.SelfHeal()
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	local before = hum.Health
+	hum.Health = hum.MaxHealth
+	if Lib.Config.ShowDamageNumbers then
+		popup({ Head = char:FindFirstChild("Head"), Root = hum.RootPart }, "+RCT", COLORS.Heal)
+	end
+	Lib.Log("обратная техника: HP %.0f → %.0f (локально)", before, hum.MaxHealth)
+end
+
+genv.GojoDamage = Lib
+Lib.Log("библиотека загружена v%s (целей в кэше: %d)", Lib.Version, #Lib.GetTargets())
+return Lib
+end)()
+local Damage = getgenv().GojoDamage
+
+-- ====================== HollowPurple ======================
+local function LoadHollowPurple()
+local player = game.Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
+
+-- [DAMAGE] Библиотека встроена в единый скрипт (никаких внешних loadstring).
+local Damage = getgenv().GojoDamage
+
+local EasingStyleMap = {
+	[Enum.PoseEasingStyle.Linear]   = Enum.EasingStyle.Linear,
+	[Enum.PoseEasingStyle.Bounce]   = Enum.EasingStyle.Bounce,
+	[Enum.PoseEasingStyle.Cubic]    = Enum.EasingStyle.Cubic,
+	[Enum.PoseEasingStyle.Elastic]  = Enum.EasingStyle.Elastic,
+	[Enum.PoseEasingStyle.Constant] = Enum.EasingStyle.Linear,
+}
+
+local EasingDirectionMap = {
+	[Enum.PoseEasingDirection.In]    = Enum.EasingDirection.In,
+	[Enum.PoseEasingDirection.Out]   = Enum.EasingDirection.Out,
+	[Enum.PoseEasingDirection.InOut] = Enum.EasingDirection.InOut,
+}
+
+local function PlayKeyframeSequence(Model, KeyframeSequence, SpeedMult)
+	SpeedMult = SpeedMult or 1
+	local keyframes = {}
+	for _, kf in ipairs(KeyframeSequence:GetKeyframes()) do
+		table.insert(keyframes, {Time = kf.Time, KF = kf})
+	end
+	table.sort(keyframes, function(a,b) return a.Time < b.Time end)
+
+	if #keyframes == 0 then return end
+
+	local jointData = {}     
+	local motorMap = {}
+	local boneMap = {}
+
+	local function ResolveJoint(pose)
+		local name = pose.Name
+		if motorMap[name] then return motorMap[name], "Motor6D" end
+		if boneMap[name] then return boneMap[name], "Bone" end
+
+		for _, v in ipairs(Model:GetDescendants()) do
+			if v:IsA("Motor6D") and v.Part1 and v.Part1.Name == name then
+				motorMap[name] = v
+				return v, "Motor6D"
+			elseif v:IsA("Bone") and v.Name == name then
+				boneMap[name] = v
+				return v, "Bone"
+			end
+		end
+		return nil, nil
+	end
+
+	for _, entry in ipairs(keyframes) do
+		for _, pose in ipairs(entry.KF:GetDescendants()) do
+			if pose:IsA("Pose") and pose.Weight > 0 then
+				local joint, jtype = ResolveJoint(pose)
+				if joint then
+					if not jointData[pose.Name] then jointData[pose.Name] = {} end
+					table.insert(jointData[pose.Name], {
+						time = entry.Time,
+						cframe = pose.CFrame,
+						style = pose.EasingStyle,
+						dir = pose.EasingDirection,
+						joint = joint,
+						jtype = jtype
+					})
+				end
+			end
+		end
+	end
+
+	local totalLength = keyframes[#keyframes].Time / SpeedMult
+	local isPlaying = true
+	local startTime = os.clock()
+
+	local conn = RunService.Heartbeat:Connect(function()
+		if not isPlaying or not Model or not Model.Parent then
+			conn:Disconnect()
+			return
+		end
+
+		local elapsed = (os.clock() - startTime) * SpeedMult
+		local timePos = elapsed % totalLength
+
+		for jointName, poses in pairs(jointData) do
+			if #poses < 1 then continue end
+			local lastPose = poses[1]
+			local nextPose = poses[1]
+
+			for i = 1, #poses - 1 do
+				if timePos >= poses[i].time and timePos < poses[i+1].time then
+					lastPose = poses[i]
+					nextPose = poses[i+1]
+					break
+				end
+			end
+
+			if timePos >= poses[#poses].time then
+				lastPose = poses[#poses]
+				nextPose = poses[#poses]
+			end
+
+			local alpha = (nextPose.time > lastPose.time) and 
+				(timePos - lastPose.time) / (nextPose.time - lastPose.time) or 0
+
+			local easedAlpha = TweenService:GetValue(alpha,
+				EasingStyleMap[nextPose.style] or Enum.EasingStyle.Linear,
+				EasingDirectionMap[nextPose.dir] or Enum.EasingDirection.InOut)
+
+			local finalCF = lastPose.cframe:Lerp(nextPose.cframe, easedAlpha)
+
+			if lastPose.jtype == "Motor6D" then
+				lastPose.joint.Transform = finalCF
+			else
+				lastPose.joint.Transform = finalCF
+			end
+		end
+	end)
+
+	return {
+		Length = totalLength,
+		Stop = function() isPlaying = false; if conn then conn:Disconnect() end end,
+		Play = function() startTime = os.clock() end
+	}
+end
+
+local asset = game:GetObjects(getcustomasset("Gojo.rbxmx"))[1]
+asset.Parent = ReplicatedStorage
+
+local tool = Instance.new("Tool")
+tool.Name = "Hollow Purple"
+tool.RequiresHandle = false
+tool.Parent = player:WaitForChild("Backpack")
+
+local function createHollowPurpleGUI()
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "GojoYapping"
+	screenGui.IgnoreGuiInset = true
+	screenGui.ResetOnSpawn = false
+	screenGui.Parent = player:WaitForChild("PlayerGui")
+
+	local blackFrame = Instance.new("Frame")
+	blackFrame.Size = UDim2.new(1, 0, 1, 0)
+	blackFrame.BackgroundColor3 = Color3.new(0, 0, 0)
+	blackFrame.BorderSizePixel = 0
+	blackFrame.Parent = screenGui
+
+	local gradient = Instance.new("UIGradient")
+	gradient.Color = ColorSequence.new{
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 0, 0)),
+		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(15, 15, 30)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 0, 0))
+	}
+	gradient.Rotation = 90
+	gradient.Parent = blackFrame
+
+	local textLabel = Instance.new("TextLabel")
+	textLabel.Size = UDim2.new(0.9, 0, 0.25, 0)
+	textLabel.Position = UDim2.new(0.05, 0, 0.35, 0)
+	textLabel.BackgroundTransparency = 1
+	textLabel.TextScaled = true
+	textLabel.Font = Enum.Font.SciFi
+	textLabel.Text = "Oh, Well."
+	textLabel.TextColor3 = Color3.fromRGB(100, 160, 255)
+	textLabel.Parent = blackFrame
+
+	local textGradient = Instance.new("UIGradient")
+	textGradient.Color = ColorSequence.new{
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(80, 170, 255)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(200, 230, 255))
+	}
+	textGradient.Parent = textLabel
+
+	return screenGui, textLabel
+end
+
+local originalBrightness = Lighting.Brightness
+local originalAmbient = Lighting.Ambient
+local originalClockTime = Lighting.ClockTime
+local originalLightingStyle = Lighting.LightingStyle or Enum.LightingStyle.Soft -- fallback
+
+tool.Activated:Connect(function()
+	local char = player.Character
+	if not char then return end
+	local hum = char:WaitForChild("Humanoid")
+	local root = char:WaitForChild("HumanoidRootPart")
+
+	Damage.Mark("Hollow Purple") -- [DAMAGE] t = 0.00s
+
+	local originalSpeed = hum.WalkSpeed
+	local originalAnimator = hum:FindFirstChild("Animator")
+	if originalAnimator then 
+		originalAnimator.Parent = nil 
+	end
+
+	Lighting.LightingStyle = Enum.LightingStyle.Realistic
+	TweenService:Create(Lighting, TweenInfo.new(2, Enum.EasingStyle.Quad), {
+		ClockTime = 0,
+		Brightness = 0.3,
+		Ambient = Color3.fromRGB(10, 10, 20)
+	}):Play()
+
+	local gui, textLabel = createHollowPurpleGUI()
+	task.spawn(function()
+		task.wait(3)
+		textLabel.Text = "Guess I'll be a little rough."
+		textLabel.TextColor3 = Color3.fromRGB(255, 90, 90)
+		
+		local tg = textLabel:FindFirstChildWhichIsA("UIGradient")
+		if tg then
+			tg.Color = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 110, 110)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 200, 180))
+			}
+		end
+		task.wait(2)
+		gui:Destroy()
+	end)
+
+	local hpFolder = asset:WaitForChild("Effects"):WaitForChild("HollowPurple"):Clone()
+
+	local blueOrb = hpFolder:FindFirstChild("BlueOrb") or hpFolder:FindFirstChild("Blue Orb")
+	local redOrb = hpFolder:FindFirstChild("RedOrb") or hpFolder:FindFirstChild("Red Orb")
+	local purple = hpFolder:FindFirstChild("Purple")
+	local purple2 = hpFolder:FindFirstChild("Purple2")
+
+	local blueWeld, redWeld, purpleWeld
+
+	if blueOrb then
+		blueOrb.CFrame = root.CFrame * CFrame.new(-5, 0, 8)
+		blueOrb.Anchored = true
+		blueOrb.Parent = workspace
+		
+		blueWeld = Instance.new("WeldConstraint")
+		blueWeld.Part0 = root
+		blueWeld.Part1 = blueOrb
+		blueWeld.Parent = blueOrb
+	end
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = getcustomasset("Purple.mp3")
+	sound.Volume = 1
+	sound.Parent = workspace
+	sound:Play()
+
+	hum.WalkSpeed = 0
+
+	task.wait(4)
+
+	local animPlayer = PlayKeyframeSequence(char, asset:WaitForChild("Anims"):WaitForChild("Purple"), 0.5 + 0.09)
+	animPlayer.Play()
+	Damage.Log("анимация Purple началась") -- [DAMAGE] t ≈ 4.0s (без урона)
+
+	task.wait(4)
+	Damage.Log("Blue Orb (Lapse: Blue) призван") -- [DAMAGE] t ≈ 8.0s (заряд, без урона)
+	if blueOrb then
+		local summon = blueOrb:FindFirstChild("Summon")
+		if summon then
+			for _, p in ipairs(summon:GetDescendants()) do
+				if p:IsA("ParticleEmitter") then p.Enabled = true end
+			end
+			task.wait(0.2)
+			for _, p in ipairs(summon:GetDescendants()) do
+				if p:IsA("ParticleEmitter") then p.Enabled = false end
+			end
+		end
+
+		local attA = blueOrb:FindFirstChild("AttachmentA")
+		if attA then
+			for _, obj in ipairs(attA:GetDescendants()) do
+				if obj:IsA("ParticleEmitter") then obj.Enabled = true
+				elseif obj:IsA("PointLight") then obj.Brightness = 1 end
+			end
+		end
+
+		local BGround = blueOrb:FindFirstChild("Ground")
+		if BGround then
+			for _, p in ipairs(BGround:GetDescendants()) do
+				if p:IsA("ParticleEmitter") then p.Enabled = true end
+			end
+		end
+	end
+
+	if redOrb then
+		redOrb.CFrame = root.CFrame * CFrame.new(5, 0, 8)
+		redOrb.Anchored = true
+		redOrb.Parent = workspace
+		
+		redWeld = Instance.new("WeldConstraint")
+		redWeld.Part0 = root
+		redWeld.Part1 = redOrb
+		redWeld.Parent = redOrb
+	end
+
+	task.wait(2)
+	Damage.Log("Red Orb (Reversal: Red) призван") -- [DAMAGE] t ≈ 10.2s (заряд, без урона)
+	if redOrb then
+		local summon = redOrb:FindFirstChild("Summon")
+		if summon then
+			for _, p in ipairs(summon:GetDescendants()) do
+				if p:IsA("ParticleEmitter") then p.Enabled = true end
+			end
+			task.wait(0.2)
+			for _, p in ipairs(summon:GetDescendants()) do
+				if p:IsA("ParticleEmitter") then p.Enabled = false end
+			end
+		end
+
+		local attA = redOrb:FindFirstChild("AttachmentA")
+		if attA then
+			for _, obj in ipairs(attA:GetDescendants()) do
+				if obj:IsA("ParticleEmitter") then obj.Enabled = true
+				elseif obj:IsA("PointLight") then obj.Brightness = 1 end
+			end
+		end
+
+		local Ground = redOrb:FindFirstChild("Ground")
+		if Ground then
+			for _, p in ipairs(Ground:GetDescendants()) do
+				if p:IsA("ParticleEmitter") then p.Enabled = true end
+			end
+		end
+	end
+
+	task.wait(1)
+	if blueWeld then blueWeld:Destroy() end
+	if redWeld then redWeld:Destroy() end
+
+	if blueOrb and redOrb then
+		TweenService:Create(blueOrb, TweenInfo.new(6.5, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), 
+			{CFrame = root.CFrame * CFrame.new(0.5, 1, 8)}):Play()
+		TweenService:Create(redOrb, TweenInfo.new(6.5, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), 
+			{CFrame = root.CFrame * CFrame.new(-0.5, 1, 8)}):Play()
+	end
+
+	task.wait(3.8)
+
+	if blueOrb then blueOrb:Destroy() end
+	if redOrb then redOrb:Destroy() end
+	Damage.Log("Blue + Red слились → заряд Purple (7s)") -- [DAMAGE] t ≈ 15.2s (без урона)
+
+	if purple then
+		purple.CFrame = root.CFrame * CFrame.new(0, 10, -20)
+		purple.Anchored = true
+		purple.Parent = workspace
+		
+		purpleWeld = Instance.new("WeldConstraint")
+		purpleWeld.Part0 = root
+		purpleWeld.Part1 = purple
+		purpleWeld.Parent = purple
+	end
+
+	task.wait(7)
+
+	if purple then 
+		if purpleWeld then purpleWeld:Destroy() end
+		purple:Destroy() 
+	end
+
+	if purple2 then
+		purple2.Anchored = true
+		for _, v in ipairs(purple2:GetDescendants()) do
+			if v:IsA("BasePart") then
+				v.Anchored = true
+				v.CanCollide = false
+			end
+		end
+
+		local lookDirection = root.CFrame.LookVector
+		local spawnCFrame = root.CFrame * CFrame.new(0, 10, -8)
+		
+		purple2.CFrame = spawnCFrame
+		purple2.Rotation = Vector3.new(0, math.deg(math.atan2(lookDirection.X, lookDirection.Z)), 0)
+		
+		purple2.Parent = workspace
+
+		local currentCFrame = purple2.CFrame
+		local startTime = os.clock()
+		local duration = 15
+
+		local connection
+		connection = RunService.Heartbeat:Connect(function()
+			local elapsed = os.clock() - startTime
+			if elapsed >= duration or not purple2.Parent then
+				connection:Disconnect()
+				return
+			end
+
+			currentCFrame = currentCFrame + (lookDirection * 280 * 0.016)
+			purple2.CFrame = currentCFrame
+		end)
+
+		Debris:AddItem(purple2, duration)
+
+		-- [DAMAGE] t ≈ 22.2s — ЗАПУСК Purple2. Свип подключён сразу после коннекта движения,
+		-- поэтому в каждом кадре проверяется уже обновлённая позиция снаряда (погрешность 0 кадров).
+		-- Прямое попадание (R = 17.5 = визуальная сфера 35 st) → стирание; касательная волна → % HP.
+		do
+			local cfg = Damage.Config.HollowPurple
+			Damage.Sweep({
+				Name = "Hollow Purple",
+				Part = purple2,
+				Radius = cfg.HitRadius,
+				Lethal = cfg.Lethal,
+				DirectFraction = cfg.DirectFraction,
+				ShockRadius = cfg.ShockwaveRadius,
+				ShockFraction = cfg.ShockwaveFraction,
+				Duration = duration, -- 15s — ровно столько живёт снаряд (Debris)
+			})
+		end
+
+		task.wait(0.5)
+		TweenService:Create(Lighting, TweenInfo.new(3, Enum.EasingStyle.Quad), {
+			ClockTime = originalClockTime,
+			Brightness = originalBrightness,
+			Ambient = originalAmbient
+		}):Play()
+		Lighting.LightingStyle = originalLightingStyle
+	end
+
+	task.wait(1)
+
+	animPlayer.Stop()
+	if originalAnimator then 
+		originalAnimator.Parent = hum 
+	end
+	hum.WalkSpeed = originalSpeed
+
+	hpFolder:Destroy()
+end)
+end
+
+-- ====================== InfiniteVoid ======================
+local function LoadInfiniteVoid()
+local tool = Instance.new("Tool")
+tool.Name = "Infinite Void"
+tool.RequiresHandle = false
+tool.Parent = game.Players.LocalPlayer:WaitForChild("Backpack")
+
+local player = game.Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local root = character:WaitForChild("HumanoidRootPart")
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+
+-- [DAMAGE] Библиотека встроена в единый скрипт (никаких внешних loadstring).
+local Damage = getgenv().GojoDamage
+-- Домен активен от открытия (t≈4.5s) до BreakDomain (t≈28.5s): 4 + 13 + 1 + 4 + 1 + 1 = 24s
+local DOMAIN_ACTIVE_TIME = 24
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+
+local EasingStyleMap = {
+	[Enum.PoseEasingStyle.Linear]   = Enum.EasingStyle.Linear,
+	[Enum.PoseEasingStyle.Bounce]   = Enum.EasingStyle.Bounce,
+	[Enum.PoseEasingStyle.Cubic]    = Enum.EasingStyle.Cubic,
+	[Enum.PoseEasingStyle.Elastic]  = Enum.EasingStyle.Elastic,
+	[Enum.PoseEasingStyle.Constant] = Enum.EasingStyle.Linear,
+}
+
+local EasingDirectionMap = {
+	[Enum.PoseEasingDirection.In]    = Enum.EasingDirection.In,
+	[Enum.PoseEasingDirection.Out]   = Enum.EasingDirection.Out,
+	[Enum.PoseEasingDirection.InOut] = Enum.EasingDirection.InOut,
+}
+
+local function PlayKeyframeSequence(Model, KeyframeSequence, SpeedMult)
+	SpeedMult = SpeedMult or 1
+	local keyframes = {}
+	for _, kf in ipairs(KeyframeSequence:GetKeyframes()) do
+		table.insert(keyframes, {Time = kf.Time, KF = kf})
+	end
+	table.sort(keyframes, function(a,b) return a.Time < b.Time end)
+
+	if #keyframes == 0 then return end
+
+	local jointData = {}     
+	local motorMap = {}
+	local boneMap = {}
+
+	local function ResolveJoint(pose)
+		local name = pose.Name
+		if motorMap[name] then return motorMap[name], "Motor6D" end
+		if boneMap[name] then return boneMap[name], "Bone" end
+
+		for _, v in ipairs(Model:GetDescendants()) do
+			if v:IsA("Motor6D") and v.Part1 and v.Part1.Name == name then
+				motorMap[name] = v
+				return v, "Motor6D"
+			elseif v:IsA("Bone") and v.Name == name then
+				boneMap[name] = v
+				return v, "Bone"
+			end
+		end
+		return nil, nil
+	end
+
+	for _, entry in ipairs(keyframes) do
+		for _, pose in ipairs(entry.KF:GetDescendants()) do
+			if pose:IsA("Pose") and pose.Weight > 0 then
+				local joint, jtype = ResolveJoint(pose)
+				if joint then
+					if not jointData[pose.Name] then jointData[pose.Name] = {} end
+					table.insert(jointData[pose.Name], {
+						time = entry.Time,
+						cframe = pose.CFrame,
+						style = pose.EasingStyle,
+						dir = pose.EasingDirection,
+						joint = joint,
+						jtype = jtype
+					})
+				end
+			end
+		end
+	end
+
+	local totalLength = keyframes[#keyframes].Time / SpeedMult
+	local isPlaying = true
+	local startTime = os.clock()
+
+	local conn = RunService.Heartbeat:Connect(function()
+		if not isPlaying or not Model or not Model.Parent then
+			conn:Disconnect()
+			return
+		end
+
+		local elapsed = (os.clock() - startTime) * SpeedMult
+		local timePos = elapsed % totalLength
+
+		for jointName, poses in pairs(jointData) do
+			if #poses < 1 then continue end
+			local lastPose = poses[1]
+			local nextPose = poses[1]
+
+			for i = 1, #poses - 1 do
+				if timePos >= poses[i].time and timePos < poses[i+1].time then
+					lastPose = poses[i]
+					nextPose = poses[i+1]
+					break
+				end
+			end
+
+			if timePos >= poses[#poses].time then
+				lastPose = poses[#poses]
+				nextPose = poses[#poses]
+			end
+
+			local alpha = (nextPose.time > lastPose.time) and 
+				(timePos - lastPose.time) / (nextPose.time - lastPose.time) or 0
+
+			local easedAlpha = TweenService:GetValue(alpha,
+				EasingStyleMap[nextPose.style] or Enum.EasingStyle.Linear,
+				EasingDirectionMap[nextPose.dir] or Enum.EasingDirection.InOut)
+
+			local finalCF = lastPose.cframe:Lerp(nextPose.cframe, easedAlpha)
+
+			if lastPose.jtype == "Motor6D" then
+				lastPose.joint.Transform = finalCF
+			else
+				lastPose.joint.Transform = finalCF
+			end
+		end
+	end)
+
+	return {
+		Length = totalLength,
+		Stop = function() isPlaying = false; if conn then conn:Disconnect() end end,
+		Play = function() startTime = os.clock() end
+	}
+end
+
+local asset = nil
+local infiniteVoidFolder = nil
+local domainFolder = nil
+local splatter = nil
+local domainPart = nil
+local linePart = nil
+local voidSky = nil
+
+local originalSpeed = 16
+local originalAnimator = nil
+local originalCFrame = nil
+local domainSound = nil
+local breakSound = nil
+
+local leftFingerMotor, rightFingerMotor = nil, nil
+local leftHandle, rightHandle = nil, nil
+
+local function ClearFingers()
+	if leftFingerMotor then leftFingerMotor:Destroy() end
+	if rightFingerMotor then rightFingerMotor:Destroy() end
+	if leftHandle then leftHandle:Destroy() end
+	if rightHandle then rightHandle:Destroy() end
+	
+	leftFingerMotor, rightFingerMotor = nil, nil
+	leftHandle, rightHandle = nil, nil
+end
+
+local function SpawnFingers()
+	ClearFingers()
+	
+	local success, model = pcall(function()
+		return game:GetObjects("rbxassetid://18637374258")[1]
+	end)
+	
+	if not success or not model then return end
+	
+	leftHandle = model:FindFirstChild("LeftHandle")
+	rightHandle = model:FindFirstChild("RightHandle")
+	
+	if not (leftHandle and rightHandle) then
+		model:Destroy()
+		return
+	end
+	
+	local char = player.Character
+	local leftArm = char:FindFirstChild("Left Arm") or char:FindFirstChild("LeftUpperArm")
+	local rightArm = char:FindFirstChild("Right Arm") or char:FindFirstChild("RightUpperArm")
+	
+	local skinColor = (leftArm and leftArm.Color) or (rightArm and rightArm.Color) or Color3.fromRGB(255, 204, 153)
+	local handOffset = CFrame.new(0, -0.88, 0)
+
+	local leftBase = leftHandle:FindFirstChildWhichIsA("BasePart") or leftHandle
+	for _, part in pairs(leftHandle:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Color = skinColor
+		end
+	end
+	
+	leftFingerMotor = Instance.new("Motor6D")
+	leftFingerMotor.Name = "LeftFingerJoint"
+	leftFingerMotor.Part0 = leftArm
+	leftFingerMotor.Part1 = leftBase
+	leftFingerMotor.C0 = handOffset
+	leftFingerMotor.C1 = CFrame.new()
+	leftFingerMotor.Parent = leftArm
+	leftHandle.Parent = char
+
+	local rightBase = rightHandle:FindFirstChildWhichIsA("BasePart") or rightHandle
+	for _, part in pairs(rightHandle:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Color = skinColor
+		end
+	end
+	
+	rightFingerMotor = Instance.new("Motor6D")
+	rightFingerMotor.Name = "RightFingerJoint"
+	rightFingerMotor.Part0 = rightArm
+	rightFingerMotor.Part1 = rightBase
+	rightFingerMotor.C0 = handOffset
+	rightFingerMotor.C1 = CFrame.new()
+	rightFingerMotor.Parent = rightArm
+	rightHandle.Parent = char
+
+	model:Destroy()
+end
+
+local function LoadAsset()
+	if asset then return end
+	asset = game:GetObjects(getcustomasset("Gojo.rbxmx"))[1]
+	asset.Parent = ReplicatedStorage
+	
+	infiniteVoidFolder = asset:WaitForChild("Effects"):WaitForChild("InfiniteVoid")
+	domainFolder = infiniteVoidFolder:WaitForChild("Domain")
+	splatter = infiniteVoidFolder:WaitForChild("Splatter")
+	domainPart = domainFolder:WaitForChild("Part")
+	linePart = domainFolder:WaitForChild("Line")
+	voidSky = domainFolder:FindFirstChild("VoidSky")
+
+	domainFolder.Parent = workspace
+	splatter.Parent = workspace
+end
+
+local function LoadSound()
+	if domainSound then return end
+	domainSound = Instance.new("Sound")
+	domainSound.SoundId = getcustomasset("Domain.mp3")
+	domainSound.Volume = 1
+	domainSound.Parent = workspace
+end
+
+local function LoadBreakSound()
+	if breakSound then return end
+	breakSound = Instance.new("Sound")
+	breakSound.SoundId = "rbxassetid://123029417877438"
+	breakSound.Volume = 1
+	breakSound.Parent = workspace
+end
+
+local function ResetForReuse()
+	ClearFingers()
+	
+	if domainFolder and domainFolder.Parent ~= workspace then
+		domainFolder.Parent = workspace
+	end
+	if splatter and splatter.Parent ~= workspace then
+		splatter.Parent = workspace
+	end
+	
+	if voidSky then voidSky.Parent = domainFolder end
+	
+	for _, obj in ipairs(domainFolder:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Beam") then
+			obj.Enabled = false
+		end
+	end
+end
+
+local function DisableUnionCollision()
+	for _, obj in ipairs(domainFolder:GetDescendants()) do
+		if obj:IsA("UnionOperation") or obj.Name:lower():find("union") then
+			obj.CanCollide = false
+			obj.Anchored = true
+		end
+	end
+	domainPart.CanCollide = true
+	domainPart.Anchored = true
+end
+
+local function ResetSplatter()
+	splatter.Transparency = 1
+	splatter.CanCollide = false
+	
+	for _, v in ipairs(splatter:GetDescendants()) do
+		if v:IsA("BasePart") and v ~= splatter then
+			v.Transparency = 0
+			v.CanCollide = false
+		end
+	end
+end
+
+local function SetupDomain()
+	for _, obj in ipairs(domainFolder:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Beam") then
+			obj.Enabled = false
+		end
+	end
+	for _, obj in ipairs(linePart:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Beam") then
+			obj.Enabled = true
+		end
+	end
+end
+
+local function RestoreDomain()
+	for _, obj in ipairs(domainFolder:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Beam") then
+			obj.Enabled = (obj.Parent ~= linePart and obj.Parent.Parent ~= linePart)
+		end
+	end
+end
+
+local function CreateWhiteScreen()
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.IgnoreGuiInset = true
+	screenGui.ResetOnSpawn = false
+	screenGui.Parent = player:WaitForChild("PlayerGui")
+	
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.new(1,0,1,0)
+	frame.BackgroundColor3 = Color3.new(1,1,1)
+	frame.BackgroundTransparency = 1
+	frame.BorderSizePixel = 0
+	frame.Parent = screenGui
+	
+	return screenGui, frame
+end
+
+local function BreakDomain()
+	for _, obj in ipairs(domainFolder:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Beam") then
+			obj.Enabled = false
+		end
+	end
+	if voidSky then voidSky.Parent = ReplicatedStorage end
+	domainFolder.Parent = ReplicatedStorage
+	splatter.Parent = ReplicatedStorage
+end
+
+tool.Activated:Connect(function()
+	LoadAsset()
+	LoadSound()
+	LoadBreakSound()
+	ResetForReuse()
+	
+	character = player.Character
+	if not character then return end
+	humanoid = character:WaitForChild("Humanoid")
+	root = character:WaitForChild("HumanoidRootPart")
+
+	Damage.Mark("Unlimited Void") -- [DAMAGE] t = 0.00s
+	local domainHit = nil        -- [DAMAGE] хэндл домена (Collapse при разрушении)
+	
+	originalSpeed = humanoid.WalkSpeed
+	originalCFrame = root.CFrame
+	
+	originalAnimator = humanoid:FindFirstChild("Animator")
+	if originalAnimator then originalAnimator.Parent = nil end
+	
+	SpawnFingers()
+	
+	local keyframeSeq = asset:WaitForChild("Anims"):WaitForChild("Infinite_Void")
+	local animPlayer = PlayKeyframeSequence(character, keyframeSeq, 1)
+	animPlayer.Play()
+	
+	humanoid.WalkSpeed = 0
+	
+	ResetSplatter()
+	splatter.CFrame = root.CFrame * CFrame.new(0, -3.5, 0)
+	
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = root
+	weld.Part1 = splatter
+	weld.Parent = splatter
+	
+	domainSound:Stop()
+	domainSound:Play()
+
+	task.spawn(function()
+		task.wait(1.2)
+		animPlayer.Stop()
+	end)
+	
+	task.wait(4.5)
+	splatter.Parent = ReplicatedStorage
+	
+	DisableUnionCollision()
+	if voidSky then voidSky.Parent = Lighting end
+
+	-- Визуал домена размещаем вокруг точки каста, НЕ телепортируя игрока.
+	-- Игрок остаётся на месте, а меш домена (300×300) центрируется на нём.
+	if domainPart and domainPart:IsA("BasePart") then
+		domainPart.CFrame = originalCFrame * CFrame.new(0, 0, 0)
+	end
+
+	-- [DAMAGE] t ≈ 4.5s — ДОМЕН ОТКРЫТ (sure-hit). Центр — точка каста (originalCFrame).
+	-- Телепортации игрока НЕТ (cfg.NoTeleport) — ты остаёшься на месте, визуал развернулся вокруг.
+	-- Все Humanoid в радиусе: мгновенное стирание; вошедшие позже стираются сразу.
+	do
+		local cfg = Damage.Config.InfiniteVoid
+		domainHit = Damage.Domain({
+			Name = "Unlimited Void",
+			Position = originalCFrame.Position,
+			Radius = cfg.Radius,
+			TickInterval = cfg.TickInterval,
+			Duration = DOMAIN_ACTIVE_TIME,
+			TotalFraction = cfg.TotalDamageFraction,
+			Paralyze = cfg.Paralyze,
+			FreezeInPlace = cfg.FreezeInPlace,
+			InstantEraseOnOpen = cfg.InstantEraseOnOpen,
+			KillOnCollapse = cfg.KillOnCollapse,
+		})
+	end
+
+	SetupDomain()
+	
+	local linesGui, linesFrame = CreateWhiteScreen()
+	TweenService:Create(linesFrame, TweenInfo.new(4.5, Enum.EasingStyle.Linear), {BackgroundTransparency = 0}):Play()
+	
+	task.wait(4)
+	linesGui:Destroy()
+	
+	RestoreDomain()
+	humanoid.WalkSpeed = originalSpeed
+	
+	if originalAnimator then
+		originalAnimator.Parent = humanoid
+	end
+	ClearFingers()
+	
+	task.wait(13)
+	
+	
+	task.wait(1)
+	
+	local finalGui, finalFrame = CreateWhiteScreen()
+	TweenService:Create(finalFrame, TweenInfo.new(4, Enum.EasingStyle.Linear), {BackgroundTransparency = 0}):Play()
+	
+	task.wait(4)
+	
+	for _, obj in ipairs(linePart:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Beam") then
+			obj.Enabled = false
+		end
+	end
+
+    task.wait(1)
+    breakSound:Stop()
+	breakSound:Play()
+	Damage.Log("звук разрушения домена") -- [DAMAGE] t ≈ 27.5s
+
+	task.wait(1)
+	
+	-- [DAMAGE] t ≈ 28.5s — ДОМЕН СХЛОПНУЛСЯ: добивание пойманных (KillOnCollapse) и снятие паралича.
+	if domainHit then domainHit.Collapse() end
+	BreakDomain()
+	finalGui:Destroy()
+
+	-- NoTeleport: не возвращаем игрока никуда (он и не телепортировался)
+
+	humanoid.WalkSpeed = originalSpeed
+end)
+end
+
+-- ====================== ImaginaryPurple ======================
+local function LoadImaginaryPurple()
+local player = game.Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+-- [DAMAGE] Библиотека встроена в единый скрипт (никаких внешних loadstring).
+local Damage = getgenv().GojoDamage
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+
+local EasingStyleMap = {
+	[Enum.PoseEasingStyle.Linear]   = Enum.EasingStyle.Linear,
+	[Enum.PoseEasingStyle.Bounce]   = Enum.EasingStyle.Bounce,
+	[Enum.PoseEasingStyle.Cubic]    = Enum.EasingStyle.Cubic,
+	[Enum.PoseEasingStyle.Elastic]  = Enum.EasingStyle.Elastic,
+	[Enum.PoseEasingStyle.Constant] = Enum.EasingStyle.Linear,
+}
+
+local EasingDirectionMap = {
+	[Enum.PoseEasingDirection.In]    = Enum.EasingDirection.In,
+	[Enum.PoseEasingDirection.Out]   = Enum.EasingDirection.Out,
+	[Enum.PoseEasingDirection.InOut] = Enum.EasingDirection.InOut,
+}
+
+local function PlayKeyframeSequence(Model, KeyframeSequence, SpeedMult)
+	SpeedMult = SpeedMult or 1
+	local keyframes = {}
+	for _, kf in ipairs(KeyframeSequence:GetKeyframes()) do
+		table.insert(keyframes, {Time = kf.Time, KF = kf})
+	end
+	table.sort(keyframes, function(a,b) return a.Time < b.Time end)
+
+	if #keyframes == 0 then return end
+
+	local jointData = {}     
+	local motorMap = {}
+	local boneMap = {}
+
+	local function ResolveJoint(pose)
+		local name = pose.Name
+		if motorMap[name] then return motorMap[name], "Motor6D" end
+		if boneMap[name] then return boneMap[name], "Bone" end
+
+		for _, v in ipairs(Model:GetDescendants()) do
+			if v:IsA("Motor6D") and v.Part1 and v.Part1.Name == name then
+				motorMap[name] = v
+				return v, "Motor6D"
+			elseif v:IsA("Bone") and v.Name == name then
+				boneMap[name] = v
+				return v, "Bone"
+			end
+		end
+		return nil, nil
+	end
+
+	for _, entry in ipairs(keyframes) do
+		for _, pose in ipairs(entry.KF:GetDescendants()) do
+			if pose:IsA("Pose") and pose.Weight > 0 then
+				local joint, jtype = ResolveJoint(pose)
+				if joint then
+					if not jointData[pose.Name] then jointData[pose.Name] = {} end
+					table.insert(jointData[pose.Name], {
+						time = entry.Time,
+						cframe = pose.CFrame,
+						style = pose.EasingStyle,
+						dir = pose.EasingDirection,
+						joint = joint,
+						jtype = jtype
+					})
+				end
+			end
+		end
+	end
+
+	local totalLength = keyframes[#keyframes].Time / SpeedMult
+	local isPlaying = true
+	local startTime = os.clock()
+	local connection
+
+	connection = RunService.Heartbeat:Connect(function()
+		if not isPlaying or not Model or not Model.Parent then
+			if connection then connection:Disconnect() end
+			return
+		end
+
+		local elapsed = (os.clock() - startTime) * SpeedMult
+		local timePos = elapsed % totalLength
+
+		for jointName, poses in pairs(jointData) do
+			if #poses < 1 then continue end
+			local lastPose = poses[1]
+			local nextPose = poses[1]
+
+			for i = 1, #poses - 1 do
+				if timePos >= poses[i].time and timePos < poses[i+1].time then
+					lastPose = poses[i]
+					nextPose = poses[i+1]
+					break
+				end
+			end
+
+			if timePos >= poses[#poses].time then
+				lastPose = poses[#poses]
+				nextPose = poses[#poses]
+			end
+
+			local alpha = (nextPose.time > lastPose.time) and 
+				(timePos - lastPose.time) / (nextPose.time - lastPose.time) or 0
+
+			local easedAlpha = TweenService:GetValue(alpha,
+				EasingStyleMap[nextPose.style] or Enum.EasingStyle.Linear,
+				EasingDirectionMap[nextPose.dir] or Enum.EasingDirection.InOut)
+
+			local finalCF = lastPose.cframe:Lerp(nextPose.cframe, easedAlpha)
+
+			if lastPose.jtype == "Motor6D" then
+				lastPose.joint.Transform = finalCF
+			else
+				lastPose.joint.Transform = finalCF
+			end
+		end
+	end)
+
+	return {
+		Length = totalLength,
+		Stop = function() 
+			isPlaying = false 
+			if connection then connection:Disconnect() end 
+		end,
+		Play = function() startTime = os.clock() end
+	}
+end
+
+local asset = game:GetObjects(getcustomasset("Gojo.rbxmx"))[1]
+asset.Parent = ReplicatedStorage
+
+local tool = Instance.new("Tool")
+tool.Name = "Imaginary Hollow Purple"
+tool.RequiresHandle = false
+tool.Parent = player:WaitForChild("Backpack")
+
+tool.Activated:Connect(function()
+	local char = player.Character
+	if not char then return end
+	local hum = char:WaitForChild("Humanoid")
+	local root = char:WaitForChild("HumanoidRootPart")
+	local rightArm = char:FindFirstChild("Right Arm") or char:FindFirstChild("RightHand")
+
+	Damage.Mark("Imaginary Purple") -- [DAMAGE] t = 0.00s
+
+	local originalSpeed = hum.WalkSpeed
+	local originalAnimator = hum:FindFirstChild("Animator")
+	if originalAnimator then originalAnimator.Parent = nil end
+
+	local camera = workspace.CurrentCamera
+	local originalCameraType = camera.CameraType
+	local originalCameraSubject = camera.CameraSubject
+
+	hum.WalkSpeed = 0
+
+	local camConn = nil
+	local cameraModel = nil
+
+	local camFolder = asset:WaitForChild("Effects"):WaitForChild("ImaginaryPurple")
+	cameraModel = camFolder:FindFirstChild("Camera"):Clone()
+	local cameraPart = cameraModel and cameraModel:FindFirstChild("Torso")
+
+	if cameraModel and cameraPart then
+		cameraModel:PivotTo(root.CFrame)
+		cameraModel.Parent = workspace
+
+		camera.CameraType = Enum.CameraType.Scriptable
+		camera.CameraSubject = cameraPart
+		camera.FieldOfView = 70
+
+		camConn = RunService.RenderStepped:Connect(function()
+			if cameraPart and cameraPart.Parent then
+				camera.CFrame = cameraPart.CFrame
+			end
+		end)
+
+		local camAnimPlayer = PlayKeyframeSequence(cameraModel, asset:WaitForChild("Anims"):WaitForChild("ImaginaryCamera"), 1)
+		camAnimPlayer.Play()
+
+		task.delay(camAnimPlayer.Length + 0.5, function()
+			if camConn then camConn:Disconnect() end
+			if cameraModel then cameraModel:Destroy() end
+			camera.CameraType = originalCameraType
+			if originalCameraSubject then camera.CameraSubject = originalCameraSubject end
+			hum.CameraOffset = Vector3.new(0,0,0)
+		end)
+	end
+
+	local animPlayer = PlayKeyframeSequence(char, asset:WaitForChild("Anims"):WaitForChild("ImaginaryPurple"), 1)
+	animPlayer.Play()
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = getcustomasset("ImaginaryPurple.mp3")
+	sound.Volume = 2
+	sound.Parent = workspace
+	sound:Play()
+
+	task.wait(9)
+	Damage.Log("PurpleArm — заряд Purple в правой руке (3.5s)") -- [DAMAGE] t ≈ 9.0s (без урона)
+	local purpleArm = camFolder:FindFirstChild("PurpleArm")
+	if purpleArm then
+		purpleArm = purpleArm:Clone()
+		purpleArm.Anchored = false
+		purpleArm.CanCollide = false
+		purpleArm.Parent = workspace
+		local weld = purpleArm:FindFirstChildWhichIsA("ManualWeld") or purpleArm:FindFirstChildWhichIsA("Weld")
+		if weld then
+			weld.Part0 = rightArm
+			weld.Part1 = purpleArm
+		end
+	end
+
+	task.wait(3.5)
+
+	if purpleArm then purpleArm:Destroy() end
+
+	local purpleShoot = camFolder:FindFirstChild("PurpleShoot")
+	if purpleShoot then
+		local projectile = purpleShoot:Clone()
+		
+		projectile.Anchored = true
+		projectile.CanCollide = false
+		
+		for _, v in ipairs(projectile:GetDescendants()) do
+			if v:IsA("BasePart") then
+				v.Anchored = true
+				v.CanCollide = false
+			end
+		end
+
+		projectile.CFrame = root.CFrame * CFrame.new(0, 6, 0)
+		projectile.Parent = workspace
+
+		local direction = root.CFrame.LookVector
+		local currentCFrame = projectile.CFrame
+		local startTime = os.clock()
+		local duration = 15
+		local speed = 275
+
+		local moveConn
+		moveConn = RunService.Heartbeat:Connect(function()
+			local elapsed = os.clock() - startTime
+			if elapsed >= duration or not projectile.Parent then
+				if moveConn then moveConn:Disconnect() end
+				return
+			end
+
+			currentCFrame = currentCFrame + (direction * speed * 0.016)
+			projectile.CFrame = currentCFrame
+		end)
+
+		Debris:AddItem(projectile, duration)
+
+		-- [DAMAGE] t ≈ 12.5s — ЗАПУСК PurpleShoot. Свип подключён сразу после коннекта движения →
+		-- проверка идёт по уже обновлённой позиции в том же кадре. Прямое попадание = стирание.
+		do
+			local cfg = Damage.Config.ImaginaryPurple
+			Damage.Sweep({
+				Name = "Imaginary Purple",
+				Part = projectile,
+				Radius = cfg.HitRadius,
+				Lethal = cfg.Lethal,
+				DirectFraction = cfg.DirectFraction,
+				ShockRadius = cfg.ShockwaveRadius,
+				ShockFraction = cfg.ShockwaveFraction,
+				Duration = duration, -- 15s — время жизни снаряда
+			})
+		end
+	end
+
+	animPlayer.Stop()
+	if originalAnimator then originalAnimator.Parent = hum end
+	hum.WalkSpeed = originalSpeed
+
+	if camConn then camConn:Disconnect() end
+	if cameraModel then cameraModel:Destroy() end
+	
+	camera.CameraType = originalCameraType
+	if originalCameraSubject then camera.CameraSubject = originalCameraSubject end
+	hum.CameraOffset = Vector3.new(0, 0, 0)
+end)
+end
+
+-- ====================== UnlimitedPurple ======================
+local function LoadUnlimitedPurple()
+local player = game.Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+-- [DAMAGE] Библиотека встроена в единый скрипт (никаких внешних loadstring).
+local Damage = getgenv().GojoDamage
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+
+local EasingStyleMap = {
+	[Enum.PoseEasingStyle.Linear]   = Enum.EasingStyle.Linear,
+	[Enum.PoseEasingStyle.Bounce]   = Enum.EasingStyle.Bounce,
+	[Enum.PoseEasingStyle.Cubic]    = Enum.EasingStyle.Cubic,
+	[Enum.PoseEasingStyle.Elastic]  = Enum.EasingStyle.Elastic,
+	[Enum.PoseEasingStyle.Constant] = Enum.EasingStyle.Linear,
+}
+
+local EasingDirectionMap = {
+	[Enum.PoseEasingDirection.In]    = Enum.EasingDirection.In,
+	[Enum.PoseEasingDirection.Out]   = Enum.EasingDirection.Out,
+	[Enum.PoseEasingDirection.InOut] = Enum.EasingDirection.InOut,
+}
+
+local function PlayKeyframeSequence(Model, KeyframeSequence, SpeedMult)
+	SpeedMult = SpeedMult or 1
+	local keyframes = {}
+	for _, kf in ipairs(KeyframeSequence:GetKeyframes()) do
+		table.insert(keyframes, {Time = kf.Time, KF = kf})
+	end
+	table.sort(keyframes, function(a,b) return a.Time < b.Time end)
+
+	if #keyframes == 0 then return end
+
+	local jointData = {}     
+	local motorMap = {}
+	local boneMap = {}
+
+	local function ResolveJoint(pose)
+		local name = pose.Name
+		if motorMap[name] then return motorMap[name], "Motor6D" end
+		if boneMap[name] then return boneMap[name], "Bone" end
+
+		for _, v in ipairs(Model:GetDescendants()) do
+			if v:IsA("Motor6D") and v.Part1 and v.Part1.Name == name then
+				motorMap[name] = v
+				return v, "Motor6D"
+			elseif v:IsA("Bone") and v.Name == name then
+				boneMap[name] = v
+				return v, "Bone"
+			end
+		end
+		return nil, nil
+	end
+
+	for _, entry in ipairs(keyframes) do
+		for _, pose in ipairs(entry.KF:GetDescendants()) do
+			if pose:IsA("Pose") and pose.Weight > 0 then
+				local joint, jtype = ResolveJoint(pose)
+				if joint then
+					if not jointData[pose.Name] then jointData[pose.Name] = {} end
+					table.insert(jointData[pose.Name], {
+						time = entry.Time,
+						cframe = pose.CFrame,
+						style = pose.EasingStyle,
+						dir = pose.EasingDirection,
+						joint = joint,
+						jtype = jtype
+					})
+				end
+			end
+		end
+	end
+
+	local totalLength = keyframes[#keyframes].Time / SpeedMult
+	local isPlaying = true
+	local startTime = os.clock()
+
+	local conn = RunService.Heartbeat:Connect(function()
+		if not isPlaying or not Model or not Model.Parent then
+			conn:Disconnect()
+			return
+		end
+
+		local elapsed = (os.clock() - startTime) * SpeedMult
+		local timePos = elapsed % totalLength
+
+		for jointName, poses in pairs(jointData) do
+			if #poses < 1 then continue end
+			local lastPose = poses[1]
+			local nextPose = poses[1]
+
+			for i = 1, #poses - 1 do
+				if timePos >= poses[i].time and timePos < poses[i+1].time then
+					lastPose = poses[i]
+					nextPose = poses[i+1]
+					break
+				end
+			end
+
+			if timePos >= poses[#poses].time then
+				lastPose = poses[#poses]
+				nextPose = poses[#poses]
+			end
+
+			local alpha = (nextPose.time > lastPose.time) and 
+				(timePos - lastPose.time) / (nextPose.time - lastPose.time) or 0
+
+			local easedAlpha = TweenService:GetValue(alpha,
+				EasingStyleMap[nextPose.style] or Enum.EasingStyle.Linear,
+				EasingDirectionMap[nextPose.dir] or Enum.EasingDirection.InOut)
+
+			local finalCF = lastPose.cframe:Lerp(nextPose.cframe, easedAlpha)
+
+			if lastPose.jtype == "Motor6D" then
+				lastPose.joint.Transform = finalCF
+			else
+				lastPose.joint.Transform = finalCF
+			end
+		end
+	end)
+
+	return {
+		Length = totalLength,
+		Stop = function() isPlaying = false; if conn then conn:Disconnect() end end,
+		Play = function() startTime = os.clock() end
+	}
+end
+
+local asset = game:GetObjects(getcustomasset("Gojo.rbxmx"))[1]
+asset.Parent = ReplicatedStorage
+
+local tool = Instance.new("Tool")
+tool.Name = "Unlimited Hollow Purple"
+tool.RequiresHandle = false
+tool.Parent = player:WaitForChild("Backpack")
+
+tool.Activated:Connect(function()
+	local char = player.Character
+	if not char then return end
+	local hum = char:WaitForChild("Humanoid")
+	local root = char:WaitForChild("HumanoidRootPart")
+	local rightArm = char:FindFirstChild("Right Arm") or char:FindFirstChild("RightHand")
+
+	Damage.Mark("Unlimited Hollow Purple") -- [DAMAGE] t = 0.00s
+	local dcfg = Damage.Config.UnlimitedPurple
+	local blueContact = nil -- [DAMAGE] контактный урон Blue на орбите
+
+	local originalSpeed = hum.WalkSpeed
+	local originalHipHeight = hum.HipHeight
+	local originalAnimator = hum:FindFirstChild("Animator")
+	if originalAnimator then originalAnimator.Parent = nil end
+
+	hum.WalkSpeed = 0
+
+	local unlimitedFolder = asset:WaitForChild("Effects"):WaitForChild("UnlimitedPurple")
+
+	local blueArm   = unlimitedFolder:FindFirstChild("BlueArm")
+	local redArm    = unlimitedFolder:FindFirstChild("RedArm")
+	local redShot   = unlimitedFolder:FindFirstChild("RedShot")
+	local airEffect = unlimitedFolder:FindFirstChild("Air")
+
+	local bluePart     = unlimitedFolder:FindFirstChild("Blue"):Clone()
+	local redPart      = unlimitedFolder:FindFirstChild("Red"):Clone()
+	local purplePart   = unlimitedFolder:FindFirstChild("Purple"):Clone()
+	local explodePart  = unlimitedFolder:FindFirstChild("PurpleExplode"):Clone()
+
+	local animPlayer = PlayKeyframeSequence(char, asset:WaitForChild("Anims"):WaitForChild("UnlimitedPurple"), 1)
+	animPlayer.Play()
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = getcustomasset("UnlimitedPurple.mp3")
+	sound.Volume = 1
+	sound.Parent = workspace
+	sound:Play()
+
+	if blueArm then
+		blueArm = blueArm:Clone()
+		blueArm.Anchored = false
+		blueArm.CanCollide = false
+		blueArm.Parent = workspace
+		
+		local weld = blueArm:FindFirstChildWhichIsA("ManualWeld") or blueArm:FindFirstChildWhichIsA("Weld")
+		if weld then
+			weld.Part0 = rightArm
+			weld.Part1 = blueArm
+		end
+	end
+
+	task.wait(3)
+
+	if bluePart then
+		bluePart.Anchored = true
+		bluePart.CanCollide = false
+		bluePart.CFrame = (rightArm and rightArm.CFrame or root.CFrame) * CFrame.new(0, 0, -5)
+		bluePart.Parent = workspace
+
+		TweenService:Create(bluePart, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			CFrame = bluePart.CFrame * CFrame.new(0, 3, -14)
+		}):Play()
+
+		if blueArm then blueArm:Destroy() end
+
+		task.wait(0.6)
+
+		local orbitStart = os.clock()
+		local orbitRadius = 32
+		local orbitSpeed = 3.8
+
+		local orbitConn = RunService.Heartbeat:Connect(function()
+			local t = os.clock() - orbitStart
+			local angle = t * orbitSpeed
+			local offset = Vector3.new(math.cos(angle) * orbitRadius, 4, math.sin(angle) * orbitRadius)
+			bluePart.CFrame = root.CFrame * CFrame.new(offset) * CFrame.Angles(0, angle * 1.6, 0)
+		end)
+
+		-- [DAMAGE] t ≈ 3.6s — Blue (Lapse: Blue, вакуум) пошёл по орбите R=32 вокруг тебя.
+		-- Касание Blue = % HP с кд на цель. Коннект стоит после orbitConn → позиция уже обновлена.
+		blueContact = Damage.Contact({
+			Name = "Lapse: Blue",
+			Part = bluePart,
+			Radius = dcfg.BlueContactRadius,
+			Lethal = dcfg.BlueContactLethal,
+			Fraction = dcfg.BlueContactFraction,
+			Cooldown = dcfg.BlueContactCooldown,
+		})
+
+		task.wait(2.5)
+
+		if redArm then
+			redArm = redArm:Clone()
+			redArm.Anchored = false
+			redArm.CanCollide = false
+			redArm.Parent = workspace
+			
+			local weld = redArm:FindFirstChildWhichIsA("ManualWeld") or redArm:FindFirstChildWhichIsA("Weld")
+			if weld then
+				weld.Part0 = rightArm
+				weld.Part1 = redArm
+			end
+		end
+
+		if redPart then
+			redPart.Anchored = true
+			redPart.CanCollide = false
+			redPart.CFrame = root.CFrame * CFrame.new(0, 6, -6)
+			redPart.Parent = workspace
+
+			TweenService:Create(redPart, TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				CFrame = redPart.CFrame * CFrame.new(0, 100, 0)
+			}):Play()
+
+			-- [DAMAGE] t ≈ 6.1s — Reversal: Red выстрелен вверх, у ног вспышка RedShot →
+			-- одноразовый отталкивающий импульс вокруг тебя (% HP).
+			Damage.Pulse({
+				Name = "Reversal: Red",
+				Position = root.Position,
+				Radius = dcfg.RedPulseRadius,
+				Lethal = dcfg.RedPulseLethal,
+				Fraction = dcfg.RedPulseFraction,
+			})
+
+			if redArm then redArm:Destroy() end
+
+			if redShot then
+				redShot = redShot:Clone()
+				redShot.Anchored = false
+				redShot.CanCollide = false
+				redShot.Parent = workspace
+				
+				local weld = redShot:FindFirstChildWhichIsA("ManualWeld") or redShot:FindFirstChildWhichIsA("Weld")
+				if weld then
+					weld.Part0 = root
+					weld.Part1 = redShot
+				end
+
+				for _, p in ipairs(redShot:GetDescendants()) do
+					if p:IsA("ParticleEmitter") then p.Enabled = true end
+				end
+				task.wait(0.2)
+				for _, p in ipairs(redShot:GetDescendants()) do
+					if p:IsA("ParticleEmitter") then p.Enabled = false end
+				end
+			end
+		end
+
+		task.wait(3)
+		
+		local targetHip = originalHipHeight + 90
+		TweenService:Create(hum, TweenInfo.new(9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			HipHeight = targetHip
+		}):Play()
+
+		if airEffect then
+			airEffect = airEffect:Clone()
+			airEffect.Anchored = false
+			airEffect.CanCollide = false
+			airEffect.Parent = workspace
+			
+			local weld = airEffect:FindFirstChildWhichIsA("ManualWeld") or airEffect:FindFirstChildWhichIsA("Weld")
+			if weld then
+				weld.Part0 = root
+				weld.Part1 = airEffect
+			end
+
+			for _, p in ipairs(airEffect:GetDescendants()) do
+				if p:IsA("ParticleEmitter") then p.Enabled = true end
+			end
+		end
+
+		task.wait(5)
+
+		if orbitConn then orbitConn:Disconnect() end
+		if blueContact then blueContact.Stop() end -- [DAMAGE] t ≈ 14.3s — орбита Blue закончилась
+		Damage.Log("Blue и Red сходятся над головой") -- (без урона)
+
+		if bluePart then
+			TweenService:Create(bluePart, TweenInfo.new(1.2, Enum.EasingStyle.Quad), {
+				CFrame = root.CFrame * CFrame.new(8, 18, 0)
+			}):Play()
+		end
+		if redPart then
+			TweenService:Create(redPart, TweenInfo.new(1.2, Enum.EasingStyle.Quad), {
+				CFrame = root.CFrame * CFrame.new(-8, 18, 0)
+			}):Play()
+		end
+
+		task.wait(1)
+
+		if bluePart and redPart then
+			TweenService:Create(bluePart, TweenInfo.new(0.8, Enum.EasingStyle.Quad), {
+				CFrame = root.CFrame * CFrame.new(0, 20, 0)
+			}):Play()
+			TweenService:Create(redPart, TweenInfo.new(0.8, Enum.EasingStyle.Quad), {
+				CFrame = root.CFrame * CFrame.new(0, 20, 0)
+			}):Play()
+		end
+
+		task.wait(1.2)
+
+		if bluePart then bluePart:Destroy() end
+		if redPart then redPart:Destroy() end
+
+		if purplePart then
+			purplePart.Anchored = true
+			purplePart.CFrame = root.CFrame * CFrame.new(0, 22, 0)
+			purplePart.Parent = workspace
+		end
+		Damage.Log("Purple сформирован над головой — заряд 2.3s") -- [DAMAGE] t ≈ 16.5s (без урона)
+
+		task.wait(2.3)
+		if purplePart then purplePart:Destroy() end
+
+		if explodePart then
+			explodePart.Anchored = true
+			explodePart.CFrame = root.CFrame * CFrame.new(0, 22, 0)
+			explodePart.Parent = workspace
+
+			-- [DAMAGE] t ≈ 18.8s — PURPLE EXPLODE. Урон в тот же кадр, что и появление взрыва.
+			-- Фронт стирания расширяется за ExplosionExpandTime (0.35s = длительность вспышки частиц):
+			-- внутри LethalRadius — стирание, дальше затухание 90% → EdgeFraction к MaxRadius.
+			Damage.Explosion({
+				Name = "Unlimited Hollow Purple",
+				Position = explodePart.Position,
+				LethalRadius = dcfg.ExplosionLethalRadius,
+				MaxRadius = dcfg.ExplosionMaxRadius,
+				EdgeFraction = dcfg.ExplosionEdgeFraction,
+				ExpandTime = dcfg.ExplosionExpandTime,
+			})
+
+			for _, desc in ipairs(explodePart:GetDescendants()) do
+				if desc:IsA("ParticleEmitter") then desc.Enabled = true end
+			end
+
+			task.wait(0.35)
+
+			for _, desc in ipairs(explodePart:GetDescendants()) do
+				if desc:IsA("ParticleEmitter") then desc.Enabled = false end
+			end
+
+			Debris:AddItem(explodePart, 8)
+		end
+
+		if airEffect then 
+			task.delay(3, function()
+				if airEffect and airEffect.Parent then
+					airEffect:Destroy()
+				end
+			end)
+		end
+	end
+
+	task.wait(2)
+
+	animPlayer.Stop()
+	if originalAnimator then originalAnimator.Parent = hum end
+	hum.WalkSpeed = originalSpeed
+	hum.HipHeight = originalHipHeight
+end)
+end
+
+-- ====================== THE HONORED ONE ======================
+local EasingStyleMap = {
+	[Enum.PoseEasingStyle.Linear]   = Enum.EasingStyle.Linear,
+	[Enum.PoseEasingStyle.Bounce]   = Enum.EasingStyle.Bounce,
+	[Enum.PoseEasingStyle.Cubic]    = Enum.EasingStyle.Cubic,
+	[Enum.PoseEasingStyle.Elastic]  = Enum.EasingStyle.Elastic,
+	[Enum.PoseEasingStyle.Constant] = Enum.EasingStyle.Linear,
+}
+
+local EasingDirectionMap = {
+	[Enum.PoseEasingDirection.In]    = Enum.EasingDirection.In,
+	[Enum.PoseEasingDirection.Out]   = Enum.EasingDirection.Out,
+	[Enum.PoseEasingDirection.InOut] = Enum.EasingDirection.InOut,
+}
+
+local function PlayKeyframeSequence(Model, KeyframeSequence, SpeedMult)
+	SpeedMult = SpeedMult or 1
+	local keyframes = {}
+	for _, kf in ipairs(KeyframeSequence:GetKeyframes()) do
+		table.insert(keyframes, {Time = kf.Time, KF = kf})
+	end
+	table.sort(keyframes, function(a,b) return a.Time < b.Time end)
+
+	if #keyframes == 0 then return end
+
+	local jointData = {}     
+	local motorMap = {}
+	local boneMap = {}
+
+	local function ResolveJoint(pose)
+		local name = pose.Name
+		if motorMap[name] then return motorMap[name], "Motor6D" end
+		if boneMap[name] then return boneMap[name], "Bone" end
+
+		for _, v in ipairs(Model:GetDescendants()) do
+			if v:IsA("Motor6D") and v.Part1 and v.Part1.Name == name then
+				motorMap[name] = v
+				return v, "Motor6D"
+			elseif v:IsA("Bone") and v.Name == name then
+				boneMap[name] = v
+				return v, "Bone"
+			end
+		end
+		return nil, nil
+	end
+
+	for _, entry in ipairs(keyframes) do
+		for _, pose in ipairs(entry.KF:GetDescendants()) do
+			if pose:IsA("Pose") and pose.Weight > 0 then
+				local joint, jtype = ResolveJoint(pose)
+				if joint then
+					if not jointData[pose.Name] then jointData[pose.Name] = {} end
+					table.insert(jointData[pose.Name], {
+						time = entry.Time,
+						cframe = pose.CFrame,
+						style = pose.EasingStyle,
+						dir = pose.EasingDirection,
+						joint = joint,
+						jtype = jtype
+					})
+				end
+			end
+		end
+	end
+
+	local totalLength = keyframes[#keyframes].Time / SpeedMult
+	local isPlaying = true
+	local startTime = os.clock()
+	local connection
+
+	connection = RunService.Heartbeat:Connect(function()
+		if not isPlaying or not Model or not Model.Parent then
+			if connection then connection:Disconnect() end
+			return
+		end
+
+		local elapsed = (os.clock() - startTime) * SpeedMult
+		local timePos = elapsed % totalLength
+
+		for jointName, poses in pairs(jointData) do
+			if #poses < 1 then continue end
+			local lastPose = poses[1]
+			local nextPose = poses[1]
+
+			for i = 1, #poses - 1 do
+				if timePos >= poses[i].time and timePos < poses[i+1].time then
+					lastPose = poses[i]
+					nextPose = poses[i+1]
+					break
+				end
+			end
+
+			if timePos >= poses[#poses].time then
+				lastPose = poses[#poses]
+				nextPose = poses[#poses]
+			end
+
+			local alpha = (nextPose.time > lastPose.time) and 
+				(timePos - lastPose.time) / (nextPose.time - lastPose.time) or 0
+
+			local style = EasingStyleMap[nextPose.style] or EasingStyleMap[lastPose.style] or Enum.EasingStyle.Linear
+			local dir = EasingDirectionMap[nextPose.dir] or EasingDirectionMap[lastPose.dir] or Enum.EasingDirection.InOut
+
+			local easedAlpha = TS:GetValue(alpha, style, dir)
+
+			local finalCF = lastPose.cframe:Lerp(nextPose.cframe, easedAlpha)
+
+			if lastPose.jtype == "Motor6D" then
+				lastPose.joint.Transform = finalCF
+			else
+				lastPose.joint.Transform = finalCF
+			end
+		end
+	end)
+
+	return {
+		Length = totalLength,
+		Stop = function() 
+			isPlaying = false 
+			if connection then connection:Disconnect() end 
+		end,
+		Play = function() startTime = os.clock() end
+	}
+end
+
+local tool = Instance.new("Tool")
+tool.Name = "The Honored One"
+tool.RequiresHandle = false
+tool.Parent = player:WaitForChild("Backpack")
+
+local running = false
+
+local originalLighting = {}
+for _, v in pairs(Lighting:GetChildren()) do
+	if v:IsA("PostEffect") or v:IsA("Sky") or v:IsA("Atmosphere") then
+		originalLighting[v.ClassName] = v:Clone()
+	end
+end
+local originalClockTime = Lighting.ClockTime
+local originalBrightness = Lighting.Brightness
+local originalAmbient = Lighting.Ambient
+
+tool.Activated:Connect(function()
+	if running then return end
+	running = true
+
+	tool:Destroy()
+
+	local char = player.Character or player.CharacterAdded:Wait()
+	local humanoid = char:WaitForChild("Humanoid")
+	local root = char:WaitForChild("HumanoidRootPart")
+
+	Damage.Mark("The Honored One") -- [DAMAGE] t = 0.00s — пробуждение (атак нет)
+
+	local originalAnimator = humanoid:FindFirstChildOfClass("Animator")
+	if originalAnimator then
+		originalAnimator:Destroy()
+	end
+
+	local originalSpeed = humanoid.WalkSpeed
+	local originalHipHeight = humanoid.HipHeight
+
+	humanoid.WalkSpeed = 0
+
+	local inserted = game:GetObjects(getcustomasset("Gojo.rbxmx"))[1]
+	if inserted then
+		inserted.Parent = ReplicatedStorage
+	end
+
+	local anims = inserted and inserted:FindFirstChild("Anims", true)
+	local keyframe = anims and anims:FindFirstChild("HonoredOne")
+	if not keyframe then
+		warn("[Gojo] В Gojo.rbxmx не найдена анимация HonoredOne")
+		humanoid.WalkSpeed = originalSpeed
+		running = false
+		return
+	end
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = getcustomasset("Honored.mp3")
+	sound.Volume = 1
+	sound.Looped = false
+	sound.Parent = workspace
+	sound:Play()
+
+	-- УСКОРЕННОЕ пробуждение: анимация 1.1× вместо 0.4× (≈2.75× быстрее), подъём HipHeight за 1.2с.
+	local controller = PlayKeyframeSequence(char, keyframe, 1.1)
+	controller.Play()
+
+	TS:Create(humanoid, TweenInfo.new(1.2, Enum.EasingStyle.Quad), {HipHeight = originalHipHeight + 100}):Play()
+
+	local Vignette = true
+
+	for _, v in pairs(Lighting:GetChildren()) do v:Destroy() end
+
+	local Bloom = Instance.new("BloomEffect", Lighting)
+	local Blur = Instance.new("BlurEffect", Lighting)
+	local ColorCor = Instance.new("ColorCorrectionEffect", Lighting)
+	local SunRays = Instance.new("SunRaysEffect", Lighting)
+	local Sky = Instance.new("Sky", Lighting)
+	local Atm = Instance.new("Atmosphere", Lighting)
+
+	Bloom.Intensity = 0.3
+	Bloom.Size = 10
+	Bloom.Threshold = 0.8
+	Blur.Size = 5
+	ColorCor.Brightness = 0.1
+	ColorCor.Contrast = 0.5
+	ColorCor.Saturation = -0.3
+	ColorCor.TintColor = Color3.fromRGB(255, 235, 203)
+	SunRays.Intensity = 0.075
+	SunRays.Spread = 0.727
+
+	Sky.SkyboxBk = "http://www.roblox.com/asset/?id=151165214"
+	Sky.SkyboxDn = "http://www.roblox.com/asset/?id=151165197"
+	Sky.SkyboxFt = "http://www.roblox.com/asset/?id=151165224"
+	Sky.SkyboxLf = "http://www.roblox.com/asset/?id=151165191"
+	Sky.SkyboxRt = "http://www.roblox.com/asset/?id=151165206"
+	Sky.SkyboxUp = "http://www.roblox.com/asset/?id=151165227"
+	Sky.SunAngularSize = 10
+
+	Lighting.Ambient = Color3.fromRGB(2,2,2)
+	Lighting.Brightness = 2.25
+	Lighting.ColorShift_Bottom = Color3.fromRGB(0,0,0)
+	Lighting.ColorShift_Top = Color3.fromRGB(0,0,0)
+	Lighting.EnvironmentDiffuseScale = 0.2
+	Lighting.EnvironmentSpecularScale = 0.2
+	Lighting.GlobalShadows = true
+	Lighting.OutdoorAmbient = Color3.fromRGB(0,0,0)
+	Lighting.ShadowSoftness = 0.2
+	Lighting.ClockTime = 17
+	Lighting.GeographicLatitude = 45
+	Lighting.ExposureCompensation = 0.5
+
+	Atm.Density = 0.364
+	Atm.Offset = 0.556
+	Atm.Color = Color3.fromRGB(199, 175, 166)
+	Atm.Decay = Color3.fromRGB(44, 39, 33)
+	Atm.Glare = 0.36
+	Atm.Haze = 1.72
+
+	if Vignette then
+		local Gui = Instance.new("ScreenGui")
+		Gui.Parent = playerGui
+		Gui.IgnoreGuiInset = true
+		local ShadowFrame = Instance.new("ImageLabel")
+		ShadowFrame.Parent = Gui
+		ShadowFrame.AnchorPoint = Vector2.new(0.5,1)
+		ShadowFrame.Position = UDim2.new(0.5,0,1,0)
+		ShadowFrame.Size = UDim2.new(1,0,1.05,0)
+		ShadowFrame.BackgroundTransparency = 1
+		ShadowFrame.Image = "rbxassetid://4576475446"
+		ShadowFrame.ImageTransparency = 0.3
+		ShadowFrame.ZIndex = 10
+	end
+
+	-- Не ждём весь Honored.mp3 — хватает 2.2 секунды на подъём/вспышку, затем сразу возврат.
+	task.wait(2.2)
+	sound:Stop()
+
+	controller.Stop()
+
+	-- [DAMAGE] конец кат-сцены пробуждения — обратная техника (RCT): своё HP до максимума (локально).
+	if getgenv().GojoDamageConfig.HonoredOne.SelfHeal then
+		Damage.SelfHeal()
+	end
+
+	TS:Create(humanoid, TweenInfo.new(1, Enum.EasingStyle.Quad), {HipHeight = originalHipHeight}):Play()
+	humanoid.WalkSpeed = originalSpeed
+
+	for _, v in pairs(Lighting:GetChildren()) do v:Destroy() end
+	for _, original in pairs(originalLighting) do
+		original:Clone().Parent = Lighting
+	end
+	Lighting.ClockTime = originalClockTime
+	Lighting.Brightness = originalBrightness
+	Lighting.Ambient = originalAmbient
+
+	if humanoid and humanoid.Parent then
+		local newAnimator = Instance.new("Animator")
+		newAnimator.Parent = humanoid
+	end
+ 
+	task.wait(0.5)
+
+	-- [DAMAGE] Все 4 способности определены выше в этом же файле.
+	-- Каждая функция имеет свою область видимости, как отдельный Lua-скрипт.
+	LoadHollowPurple()
+	LoadInfiniteVoid()
+	LoadImaginaryPurple()
+	LoadUnlimitedPurple()
+
+	Damage.Log("все 4 способности созданы из единого скрипта — урон активен")
+	running = false
+end)
